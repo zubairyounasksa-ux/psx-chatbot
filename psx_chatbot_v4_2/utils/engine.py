@@ -494,13 +494,14 @@ def _fetch_psx_overview(ticker):
     from https://dps.psx.com.pk/company/{ticker}.
 
     Uses:
-      - regex on the HTML for price and free float %
-      - pandas.read_html for the Financials and Payouts tables
+      - regex on raw HTML for price & free float
+      - pandas.read_html for Financials and Payouts tables, with
+        very loose matching on headers / labels.
 
     Returns dict:
       {
         "price": "560.45",
-        "free_float_pct": "35.00%",
+        "free_float_pct": "40.00%",
         "eps_by_year": {"2025": "107.58", "2024": "18.34", ...},
         "latest_payout": {"date": "...", "details": "...", "book_closure": "..."},
         "source_url": url,
@@ -516,96 +517,113 @@ def _fetch_psx_overview(ticker):
 
     html = resp.text
 
-    # ---------- Latest price ----------
+    # ---------- 1) Latest price ----------
     price = None
     m_price = re.search(r"Rs\.\s*([\d,]+\.\d+)", html)
     if m_price:
         price = m_price.group(1)
 
-    # ---------- Free float % ----------
+    # ---------- 2) Free float % ----------
     free_float_pct = None
-    # look for the last percentage value after the words "Free Float"
     try:
         ff_matches = re.findall(
             r"Free\s*Float[^%]*?([\d.,]+\s*%)",
             html,
-            flags=re.I | re.S
+            flags=re.I | re.S,
         )
         if ff_matches:
             free_float_pct = ff_matches[-1].strip()
     except Exception:
         pass
 
-    # ---------- Tables via pandas.read_html ----------
+    # ---------- 3) Read all tables ----------
     try:
         tables = pd.read_html(html)
     except Exception:
         tables = []
 
-    eps_by_year = {}
+    eps_by_year: dict[str, str] = {}
     latest_payout = None
 
-    # ---- 1) Find Annual financials table and extract EPS row ----
+    # ---------- 3a) Find EPS by year from any "financials" table ----------
     for df in tables:
         if df.shape[0] < 1 or df.shape[1] < 2:
             continue
 
-        # Normalise first column
+        # First column usually contains labels like "Sales", "Profit after Taxation", "EPS"
         first_col = df.iloc[:, 0].astype(str).str.strip().str.lower()
 
-        # We want the table where first column includes a plain "eps"
-        if not any(first_col == "eps"):
-            continue
+        # Find any row where label contains "eps"
+        eps_row_idx = None
+        for i, label in enumerate(first_col):
+            if "eps" in label:
+                eps_row_idx = i
+                break
 
-        eps_row = df[first_col == "eps"]
-        if eps_row.empty:
-            continue
+        if eps_row_idx is None:
+            continue  # this table is not the one we want
 
-        eps_row = eps_row.iloc[0]
+        eps_row = df.iloc[eps_row_idx]
 
-        # Typical structure: first column is label, remaining columns are years 2025, 2024...
-        for col in df.columns[1:]:
-            col_str = str(col).strip()
-            if re.match(r"^(19|20)\d{2}$", col_str):
-                eps_by_year[col_str] = str(eps_row[col])
+        # Remaining columns: headers may be "2025", "2024", "2023", "2022" or like "2025*"
+        for j, col in enumerate(df.columns[1:], start=1):
+            col_name = str(col)
+            m_year = re.search(r"(19|20)\d{2}", col_name)
+            if not m_year:
+                continue
+            year = m_year.group(0)
+            eps_val = eps_row.iloc[j]
+            # skip blanks / NaN
+            if pd.isna(eps_val):
+                continue
+            eps_by_year[year] = str(eps_val)
 
         if eps_by_year:
-            break  # we found the annual EPS table
+            break  # stop once we have one EPS row
 
-    # ---- 2) Find Payouts table and take first row (latest payout) ----
+    # ---------- 3b) Find latest payout from any "payouts" table ----------
     for df in tables:
         if df.shape[0] < 1 or df.shape[1] < 2:
             continue
 
-        cols = [str(c).strip().lower() for c in df.columns]
+        cols_lower = [str(c).strip().lower() for c in df.columns]
 
-        # looking specifically for Payouts structure: Date | Financial Results | Details | Book Closure
-        if "date" in cols and "book closure" in cols:
-            row = df.iloc[0]  # latest payout is first row
-            def safe_get(col_name):
-                if col_name in cols:
-                    return str(row[cols.index(col_name)])
-                return ""
+        # We want a table that has some date column and some book-closure column
+        has_date = any("date" in c for c in cols_lower)
+        has_closure = any("closure" in c or ("book" in c and "close" in c) for c in cols_lower)
+        if not (has_date and has_closure):
+            continue
 
-            date_str = safe_get("date")
-            fin_res  = safe_get("financial results")
-            details  = safe_get("details")
-            book_closure = safe_get("book closure")
+        row0 = df.iloc[0]  # assume first row is latest payout
 
-            # Build a compact details field (keep both "Financial Results" and "Details")
-            details_parts = []
-            if fin_res:
-                details_parts.append(fin_res)
-            if details:
-                details_parts.append(details)
-            details_combined = " ".join(d for d in details_parts if d).strip()
+        def get_col(*keywords):
+            """
+            Return cell for the first column whose header contains ALL keywords.
+            """
+            for idx, cname in enumerate(cols_lower):
+                if all(k in cname for k in keywords):
+                    return str(row0.iloc[idx])
+            return ""
 
-            latest_payout = {
-                "date": date_str.strip() or None,
-                "details": details_combined or None,
-                "book_closure": book_closure.strip() or None,
-            }
-            break
+        date_val = get_col("date")
+        # Some DPS tables have both 'Financial Results' and 'Details' or 'Entitlement'
+        fin_res_val = get_col("financial", "result")
+        details_val = get_col("detail") or get_col("entitlement") or get_col("dividend")
+        book_val = get_col("book", "closure") or get_col("closure")
+
+        details_parts = []
+        if fin_res_val:
+            details_parts.append(fin_res_val)
+        if details_val:
+            details_parts.append(details_val)
+        details_combined = " ".join(details_parts).strip() or None
+
+        latest_payout = {
+            "date": date_val.strip() or None,
+            "details": details_combined,
+            "book_closure": book_val.strip() or None,
+        }
+        break  # stop after first matching payouts table
 
     return {
         "price": price,
@@ -614,7 +632,6 @@ def _fetch_psx_overview(ticker):
         "latest_payout": latest_payout,
         "source_url": url,
     }
-
 
 
 # ===================== Company snapshot (overview) =====================
