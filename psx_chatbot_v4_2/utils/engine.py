@@ -177,9 +177,40 @@ def _lookup_metric_with_context(comp, metric, period):
             "prev_value": prev_val,
             "latest_period": latest_col,
             "latest_value": latest_val,
+            "valid_cols": valid_cols,
+            "row": row,
         }
 
     return None
+
+
+def _get_metric_series(comp, metric):
+    """
+    Return full time series for a metric as {period -> value}, using first matching df.
+    """
+    if not metric:
+        return {}
+
+    for df in comp.get("files", []):
+        try:
+            first_col = df.iloc[:, 0].astype(str)
+        except Exception:
+            continue
+
+        row = df[first_col == str(metric)]
+        if row.empty:
+            continue
+
+        valid_cols = [
+            c for c in df.columns[1:]
+            if str(c).strip() and str(c).lower() != "trend"
+        ]
+        series = {}
+        for c in valid_cols:
+            series[str(c)] = row[c].values[0]
+        return series
+
+    return {}
 
 
 def _lookup_multiple_metrics_contexts(comp, metrics, period):
@@ -197,12 +228,13 @@ def _lookup_multiple_metrics_contexts(comp, metrics, period):
 
 # ===================== Formatting helpers =====================
 
-def _format_single_metric_answer(tick, metric, ctx):
+def _format_single_metric_answer(tick, metric, ctx, comp):
     """
     Human-friendly answer with analysis:
     - value in requested year,
     - comparison vs previous year,
-    - comparison vs latest year (e.g., 2025).
+    - comparison vs latest year (e.g., 2025),
+    - multi-year trend view (CAGR and where this year sits in history).
     """
     period = ctx["period"]
     value = ctx["value"]
@@ -217,7 +249,7 @@ def _format_single_metric_answer(tick, metric, ctx):
 
     lines = [f"{tick} – {metric} in {period}: {value}"]
 
-    # Compare with previous year
+    # --- vs previous year ---
     if prev_period is not None and prev_value is not None:
         if val_num is not None and prev_num not in (None, 0):
             diff = val_num - prev_num
@@ -236,7 +268,7 @@ def _format_single_metric_answer(tick, metric, ctx):
         else:
             lines.append(f"Previous period {prev_period}: {prev_value}.")
 
-    # Compare with latest year (e.g., 2025)
+    # --- vs latest year (e.g., 2025) ---
     if latest_period is not None and latest_period != period and latest_value is not None:
         if latest_num is not None and val_num not in (None, 0):
             diff_l = latest_num - val_num
@@ -258,12 +290,79 @@ def _format_single_metric_answer(tick, metric, ctx):
                 f"Latest reported year {latest_period} has value {latest_value}."
             )
 
+    # --- Expert-style multi-year view using the full series ---
+    series_raw = _get_metric_series(comp, metric)
+    series_nums = {
+        p: _to_number(v)
+        for p, v in series_raw.items()
+        if _to_number(v) is not None
+    }
+
+    if series_nums and len(series_nums) >= 3 and val_num is not None:
+        # Sort by period (as number if possible)
+        def _key(p):
+            try:
+                return int(p)
+            except Exception:
+                return p
+
+        sorted_items = sorted(series_nums.items(), key=lambda x: _key(x[0]))
+        periods_sorted = [p for p, _ in sorted_items]
+        values_sorted = [v for _, v in sorted_items]
+
+        first_period, first_val = periods_sorted[0], values_sorted[0]
+        last_period, last_val = periods_sorted[-1], values_sorted[-1]
+
+        if first_val not in (None, 0):
+            n_years = len(values_sorted) - 1
+            if n_years > 0:
+                cagr = (last_val / abs(first_val)) ** (1 / n_years) - 1
+            else:
+                cagr = 0
+        else:
+            cagr = None
+
+        min_val = min(values_sorted)
+        max_val = max(values_sorted)
+
+        # Where does the current value sit vs history?
+        position_comment = None
+        if max_val == min_val:
+            position_comment = "is broadly in line with its historical range."
+        else:
+            if val_num >= 0.9 * max_val:
+                position_comment = "is near its historical peak."
+            elif val_num <= 1.1 * min_val:
+                position_comment = "is close to the low end of its historical range."
+            else:
+                position_comment = "sits roughly in the middle of its historical range."
+
+        expert_lines = []
+        expert_lines.append(
+            f"Over the available history ({first_period}–{last_period}), "
+            f"this metric has generally trended {'upwards' if last_val >= first_val else 'downwards'}."
+        )
+        if cagr is not None:
+            expert_lines.append(
+                f"The implied compound annual growth rate (CAGR) over this period "
+                f"is approximately {cagr * 100:,.1f}%."
+            )
+        if position_comment:
+            expert_lines.append(
+                f"The {period} figure {position_comment}"
+            )
+
+        lines.append("")
+        lines.append("Expert view:")
+        lines.append(" ".join(expert_lines))
+
     return "\n".join(lines)
 
 
 def _format_multi_metric_answer(tick, keywords, metric_contexts, period):
     """
-    Bullet summary when many metrics match a keyword (e.g. 'assets', 'profit').
+    Bullet summary when many metrics match a keyword (e.g. 'assets', 'profit'),
+    with directional commentary vs previous and latest year.
     """
     kw_text = ", ".join(sorted(set(keywords)))
     period_text = f" in {period}" if period else ""
@@ -327,7 +426,8 @@ def answer_query(query, companies):
       return that single metric with:
         * value,
         * change vs previous year,
-        * change vs latest year (e.g., 2025).
+        * change vs latest year (e.g., 2025),
+        * multi-year expert commentary.
     - Otherwise, extract keywords from the query (e.g. 'assets', 'profit', 'cash')
       and return ALL metrics whose names contain those keywords, each with trend vs
       previous year and latest year.
@@ -355,7 +455,7 @@ def answer_query(query, companies):
     if precise_metric:
         ctx = _lookup_metric_with_context(comp, precise_metric, period)
         if ctx is not None:
-            return _format_single_metric_answer(tick, precise_metric, ctx)
+            return _format_single_metric_answer(tick, precise_metric, ctx, comp)
 
     # --------- Second: keyword-based multi-metric ---------
     keywords = _extract_keywords(query, tick)
@@ -383,7 +483,7 @@ def answer_query(query, companies):
             # If only one metric matched, behave like single metric
             if len(metric_contexts) == 1:
                 m, ctx = metric_contexts[0]
-                return _format_single_metric_answer(tick, m, ctx)
+                return _format_single_metric_answer(tick, m, ctx, comp)
             # Otherwise bullets
             return _format_multi_metric_answer(tick, keywords, metric_contexts, period)
 
@@ -405,4 +505,4 @@ def answer_query(query, companies):
     if ctx is None:
         return "Value not found."
 
-    return _format_single_metric_answer(tick, best, ctx)
+    return _format_single_metric_answer(tick, best, ctx, comp)
