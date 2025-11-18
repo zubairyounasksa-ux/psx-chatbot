@@ -525,35 +525,33 @@ def _fetch_psx_overview(ticker):
     if ff_matches:
         free_float_pct = ff_matches[-1].strip()
 
-    # ---------- EPS (Annual financials) ----------
+    # ---------- EPS (Financials – annual) ----------
     eps_by_year = {}
 
+    # Full Financials block (annual + quarterly)
     try:
-        # isolate Financials block
         fin_section = html.split("# Financials", 1)[1]
     except Exception:
         fin_section = ""
 
-    # restrict to between "Annual" and "Quarterly" (annual table)
-    annual_block = fin_section
-    if "Annual" in annual_block:
-        annual_block = annual_block.split("Annual", 1)[1]
-    if "Quarterly" in annual_block:
-        annual_block = annual_block.split("Quarterly", 1)[0]
+    # In practice the annual table comes first, then quarterly.
+    # We simply search the whole block for the first "years line"
+    # and the first "EPS" line – that corresponds to annual EPS.
+    search_block = fin_section
 
     # years row: pattern like "2025 2024 2023 2022"
     years = []
     m_years = re.search(
-        r"((?:19|20)\d{2}(?:\s+(?:19|20)\d{2})+)", annual_block
+        r"((?:19|20)\d{2}(?:\s+(?:19|20)\d{2})+)", search_block
     )
     if m_years:
         years = m_years.group(1).split()
 
     # EPS row: everything on the line after the word "EPS"
-    m_eps = re.search(r"EPS\s+([^\n\r#]+)", annual_block)
+    m_eps = re.search(r"EPS\s+([^\n\r#]+)", search_block)
     if m_eps and years:
         eps_segment = m_eps.group(1)
-        # capture tokens like 41.92, (4.54), 1.12, 1.77
+        # capture tokens like 41.92, (4.54), 1.12, 17.10
         vals_raw = re.findall(r"\(?[-\d.,]+\)?", eps_segment)
         for y, v in zip(years, vals_raw):
             eps_by_year[y] = v.strip()
@@ -562,14 +560,13 @@ def _fetch_psx_overview(ticker):
     latest_payout = None
     try:
         payout_section = html.split("# Payouts", 1)[1]
-        # limit to before "Financial Reports" block if present
         if "# Financial Reports" in payout_section:
             payout_section = payout_section.split("# Financial Reports", 1)[0]
     except Exception:
         payout_section = ""
 
-    # first data row typically like:
-    # "September 29, 2025 4:41 PM 30/06/2025(YR) 100%(F) (D) 17/10/2025 - 25/10/2025"
+    # first data row, e.g.:
+    # "September 29, 2025 4:54 PM 30/06/2025(YR) 100%(F) (D) 17/10/2025 - 25/10/2025"
     m_row = re.search(
         r"([A-Za-z]+\s+\d{1,2},\s+\d{4}[^#\n\r]+)",
         payout_section
@@ -613,6 +610,7 @@ def _fetch_psx_overview(ticker):
         "latest_payout": latest_payout,
         "source_url": url,
     }
+
 
 
 
