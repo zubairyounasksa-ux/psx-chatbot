@@ -518,7 +518,7 @@ def _fetch_psx_overview(ticker):
     if m:
         price = m.group(1)
 
-    # --- Tables via pandas.read_html ---
+    # --- Try to read all tables on the page ---
     try:
         tables = pd.read_html(html)
     except Exception:
@@ -532,42 +532,103 @@ def _fetch_psx_overview(ticker):
         if df.empty:
             continue
 
-        # Normalize first column for checks
-        first_col_vals = df.iloc[:, 0].astype(str).tolist()
-        cols_lower = [str(c).lower() for c in df.columns]
+        # normalise column names
+        cols_lower = [str(c).strip().lower() for c in df.columns]
 
-        # Equity profile table (contains "Free Float")
-        if any("Free Float" in v for v in first_col_vals):
-            # find the row where the second col has a % value
-            for _, row in df.iterrows():
-                if "Free Float" in str(row.iloc[0]) and "%" in str(row.iloc[1]):
-                    free_float_pct = str(row.iloc[1])
+        # 1) FREE FLOAT: look for any cell containing "free float"
+        try:
+            mask_ff = df.applymap(lambda x: "free float" in str(x).lower())
+        except Exception:
+            mask_ff = None
 
-        # Annual financials table (contains EPS row and year columns)
-        if any(str(v).strip() == "EPS" for v in first_col_vals) and \
-                any(re.search(r"(19|20)\d{2}", str(c)) for c in df.columns[1:]):
-            years = [str(c) for c in df.columns[1:]]
-            eps_row = df[df.iloc[:, 0].astype(str).str.strip() == "EPS"]
-            if not eps_row.empty:
-                for i, yr in enumerate(years, start=1):
-                    eps_val = eps_row.iloc[0, i]
-                    eps_by_year[yr] = eps_val
+        if mask_ff is not None and mask_ff.any().any():
+            # take first occurrence
+            for r in range(df.shape[0]):
+                for c in range(df.shape[1]):
+                    if mask_ff.iat[r, c]:
+                        # search horizontally around that cell for a % value
+                        candidate_vals = []
 
-        # Payouts table (Date + Book Closure)
-        if "date" in cols_lower and "book closure" in cols_lower:
-            # assume first row is the latest
+                        # same row, right side then left side
+                        for offset in [1, 2, -1, -2]:
+                            j = c + offset
+                            if 0 <= j < df.shape[1]:
+                                candidate_vals.append(str(df.iat[r, j]))
+
+                        # next row, same column
+                        if r + 1 < df.shape[0]:
+                            candidate_vals.append(str(df.iat[r + 1, c]))
+
+                        for val in candidate_vals:
+                            m_pct = re.search(r"([\d,.]+)\s*%", val)
+                            if m_pct:
+                                free_float_pct = m_pct.group(1).replace(" ", "") + "%"
+                                break
+                        break
+                if free_float_pct:
+                    break
+
+        # 2) EPS BY YEAR: find any row that contains "EPS"
+        try:
+            mask_eps = df.applymap(lambda x: "eps" in str(x).lower())
+        except Exception:
+            mask_eps = None
+
+        if mask_eps is not None and mask_eps.any().any():
+            # row index where EPS appears
+            eps_row_idx = mask_eps.any(axis=1).idxmax()
+            row = df.loc[eps_row_idx]
+
+            # years can be in column headers (most common case)
+            for col in df.columns:
+                col_str = str(col)
+                m_year = re.search(r"(19|20)\d{2}", col_str)
+                if m_year:
+                    year = m_year.group(0)
+                    eps_val = row[col]
+                    eps_by_year[year] = eps_val
+
+            # if nothing found via column headers, try the row itself
+            if not eps_by_year:
+                # e.g. first column "Year", second "EPS"
+                for i in range(1, len(row)):
+                    year_candidate = row.iloc[0]
+                    val_candidate = row.iloc[i]
+                    ymatch = re.search(r"(19|20)\d{2}", str(year_candidate))
+                    if ymatch:
+                        year = ymatch.group(0)
+                        eps_by_year[year] = val_candidate
+
+        # 3) LATEST PAYOUT: look for table with date + (details OR book closure)
+        has_date_col = any("date" in c for c in cols_lower)
+        has_details_col = any("details" in c or "particular" in c for c in cols_lower)
+        has_book_col = any(("book" in c and "closure" in c) for c in cols_lower)
+
+        if has_date_col and (has_details_col or has_book_col):
+            # assume first row is the latest payout
             row0 = df.iloc[0]
-            def _get(col_name):
-                if col_name in cols_lower:
-                    idx = cols_lower.index(col_name)
-                    return row0.iloc[idx]
+
+            def pick_col(*keywords):
+                for idx, cname in enumerate(cols_lower):
+                    if all(k in cname for k in keywords):
+                        return row0.iloc[idx]
                 return None
 
+            date_val = pick_col("date")
+            details_val = pick_col("details") or pick_col("particular")
+            book_val = pick_col("book", "closure") or pick_col("closure")
+
             latest_payout = {
-                "date": _get("date"),
-                "details": _get("details"),
-                "book_closure": _get("book closure"),
+                "date": date_val,
+                "details": details_val,
+                "book_closure": book_val,
             }
+
+    # 4) Fallback: free float via regex if we still did not find it in tables
+    if free_float_pct is None:
+        mff = re.search(r"Free\s*Float[^%]*([\d,.]+\s*%)", html, re.I)
+        if mff:
+            free_float_pct = mff.group(1).strip()
 
     return {
         "price": price,
@@ -576,6 +637,7 @@ def _fetch_psx_overview(ticker):
         "latest_payout": latest_payout,
         "source_url": url,
     }
+
 
 
 # ===================== Company snapshot (overview) =====================
