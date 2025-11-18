@@ -491,13 +491,17 @@ def _build_cross_metric_snapshot(tick, period, comp, role_index):
 def _fetch_psx_overview(ticker):
     """
     Fetch latest price, free float %, EPS by year, and latest payout
-    from https://dps.psx.com.pk/company/{ticker} by parsing the HTML text.
+    from https://dps.psx.com.pk/company/{ticker}.
+
+    Uses:
+      - regex on the HTML for price and free float %
+      - pandas.read_html for the Financials and Payouts tables
 
     Returns dict:
       {
         "price": "560.45",
-        "free_float_pct": "40.00%",
-        "eps_by_year": {"2025": "41.92", "2024": "(4.54)", ...},
+        "free_float_pct": "35.00%",
+        "eps_by_year": {"2025": "107.58", "2024": "18.34", ...},
         "latest_payout": {"date": "...", "details": "...", "book_closure": "..."},
         "source_url": url,
       }
@@ -520,88 +524,88 @@ def _fetch_psx_overview(ticker):
 
     # ---------- Free float % ----------
     free_float_pct = None
-    # capture last % value that appears after the words "Free Float"
-    ff_matches = re.findall(r"Free\s*Float.*?([\d,.]+\s*%)", html, flags=re.I | re.S)
-    if ff_matches:
-        free_float_pct = ff_matches[-1].strip()
+    # look for the last percentage value after the words "Free Float"
+    try:
+        ff_matches = re.findall(
+            r"Free\s*Float[^%]*?([\d.,]+\s*%)",
+            html,
+            flags=re.I | re.S
+        )
+        if ff_matches:
+            free_float_pct = ff_matches[-1].strip()
+    except Exception:
+        pass
 
-    # ---------- EPS (Financials – annual) ----------
+    # ---------- Tables via pandas.read_html ----------
+    try:
+        tables = pd.read_html(html)
+    except Exception:
+        tables = []
+
     eps_by_year = {}
-
-    # Full Financials block (annual + quarterly)
-    try:
-        fin_section = html.split("# Financials", 1)[1]
-    except Exception:
-        fin_section = ""
-
-    # In practice the annual table comes first, then quarterly.
-    # We simply search the whole block for the first "years line"
-    # and the first "EPS" line – that corresponds to annual EPS.
-    search_block = fin_section
-
-    # years row: pattern like "2025 2024 2023 2022"
-    years = []
-    m_years = re.search(
-        r"((?:19|20)\d{2}(?:\s+(?:19|20)\d{2})+)", search_block
-    )
-    if m_years:
-        years = m_years.group(1).split()
-
-    # EPS row: everything on the line after the word "EPS"
-    m_eps = re.search(r"EPS\s+([^\n\r#]+)", search_block)
-    if m_eps and years:
-        eps_segment = m_eps.group(1)
-        # capture tokens like 41.92, (4.54), 1.12, 17.10
-        vals_raw = re.findall(r"\(?[-\d.,]+\)?", eps_segment)
-        for y, v in zip(years, vals_raw):
-            eps_by_year[y] = v.strip()
-
-    # ---------- Latest payout (Payouts section) ----------
     latest_payout = None
-    try:
-        payout_section = html.split("# Payouts", 1)[1]
-        if "# Financial Reports" in payout_section:
-            payout_section = payout_section.split("# Financial Reports", 1)[0]
-    except Exception:
-        payout_section = ""
 
-    # first data row, e.g.:
-    # "September 29, 2025 4:54 PM 30/06/2025(YR) 100%(F) (D) 17/10/2025 - 25/10/2025"
-    m_row = re.search(
-        r"([A-Za-z]+\s+\d{1,2},\s+\d{4}[^#\n\r]+)",
-        payout_section
-    )
-    if m_row:
-        row = m_row.group(1).strip()
+    # ---- 1) Find Annual financials table and extract EPS row ----
+    for df in tables:
+        if df.shape[0] < 1 or df.shape[1] < 2:
+            continue
 
-        # split out date (with optional time)
-        m_date = re.match(
-            r"([A-Za-z]+\s+\d{1,2},\s+\d{4}(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)?)?)\s+(.*)",
-            row
-        )
-        if m_date:
-            date_str = m_date.group(1).strip()
-            rest = m_date.group(2).strip()
-        else:
-            date_str = None
-            rest = row
+        # Normalise first column
+        first_col = df.iloc[:, 0].astype(str).str.strip().str.lower()
 
-        # book closure range like "17/10/2025 - 25/10/2025"
-        m_bc = re.search(
-            r"(\d{2}/\d{2}/\d{4}\s*-\s*\d{2}/\d{2}/\d{4})",
-            rest
-        )
-        book_closure = m_bc.group(1).strip() if m_bc else None
+        # We want the table where first column includes a plain "eps"
+        if not any(first_col == "eps"):
+            continue
 
-        details = rest
-        if book_closure:
-            details = details.replace(book_closure, "").strip()
+        eps_row = df[first_col == "eps"]
+        if eps_row.empty:
+            continue
 
-        latest_payout = {
-            "date": date_str,
-            "details": details,
-            "book_closure": book_closure,
-        }
+        eps_row = eps_row.iloc[0]
+
+        # Typical structure: first column is label, remaining columns are years 2025, 2024...
+        for col in df.columns[1:]:
+            col_str = str(col).strip()
+            if re.match(r"^(19|20)\d{2}$", col_str):
+                eps_by_year[col_str] = str(eps_row[col])
+
+        if eps_by_year:
+            break  # we found the annual EPS table
+
+    # ---- 2) Find Payouts table and take first row (latest payout) ----
+    for df in tables:
+        if df.shape[0] < 1 or df.shape[1] < 2:
+            continue
+
+        cols = [str(c).strip().lower() for c in df.columns]
+
+        # looking specifically for Payouts structure: Date | Financial Results | Details | Book Closure
+        if "date" in cols and "book closure" in cols:
+            row = df.iloc[0]  # latest payout is first row
+            def safe_get(col_name):
+                if col_name in cols:
+                    return str(row[cols.index(col_name)])
+                return ""
+
+            date_str = safe_get("date")
+            fin_res  = safe_get("financial results")
+            details  = safe_get("details")
+            book_closure = safe_get("book closure")
+
+            # Build a compact details field (keep both "Financial Results" and "Details")
+            details_parts = []
+            if fin_res:
+                details_parts.append(fin_res)
+            if details:
+                details_parts.append(details)
+            details_combined = " ".join(d for d in details_parts if d).strip()
+
+            latest_payout = {
+                "date": date_str.strip() or None,
+                "details": details_combined or None,
+                "book_closure": book_closure.strip() or None,
+            }
+            break
 
     return {
         "price": price,
@@ -610,9 +614,6 @@ def _fetch_psx_overview(ticker):
         "latest_payout": latest_payout,
         "source_url": url,
     }
-
-
-
 
 
 
