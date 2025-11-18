@@ -110,6 +110,83 @@ def _to_number(val):
         return None
 
 
+# ===================== Role mapping for cross-metric analysis =====================
+
+ROLE_SYNONYMS = {
+    "sales": [
+        "sales", "revenue", "net sales", "turnover"
+    ],
+    "gross_profit": [
+        "gross profit"
+    ],
+    "pbt": [
+        "profit before taxation", "profit before tax", "pbt"
+    ],
+    "pat": [
+        "profit after taxation", "profit after tax", "net profit", "profit after tax (pat)"
+    ],
+    "equity": [
+        "shareholder equity", "shareholders equity", "shareholders' equity",
+        "total equity", "owners equity", "owners' equity", "share capital and reserves",
+        "share capital & reserves"
+    ],
+    "total_assets": [
+        "total assets"
+    ],
+    "total_liabilities": [
+        "total liabilities", "total liability"
+    ],
+    "cfo": [
+        "cash from operation", "cash from operations",
+        "cash flow from operations", "net cash from operating activities"
+    ],
+}
+
+
+def _build_role_index(comp):
+    """
+    For each 'role' (sales, pat, equity, etc.) find the best matching metric name
+    in this company's headings using fuzzy matching.
+    Returns: { role: metric_name }
+    """
+    metrics = comp.get("metrics", [])
+    index = {}
+
+    for role, syns in ROLE_SYNONYMS.items():
+        best_metric = None
+        best_score = 0
+        for m in metrics:
+            m_low = str(m).lower()
+            for syn in syns:
+                score = fuzz.partial_ratio(m_low, syn.lower())
+                if score > best_score:
+                    best_score = score
+                    best_metric = m
+        # Only keep if reasonably confident
+        if best_metric is not None and best_score >= 70:
+            index[role] = best_metric
+
+    return index
+
+
+def _get_role_value(comp, role_index, role, period):
+    """
+    Get (display_value, numeric_value) for a given role in the requested period.
+    Uses the same context lookup to align periods.
+    """
+    metric = role_index.get(role)
+    if not metric:
+        return None, None
+
+    ctx = _lookup_metric_with_context(comp, metric, period)
+    if not ctx:
+        return None, None
+
+    val = ctx["value"]
+    num = _to_number(val)
+    return val, num
+
+
 # ===================== Data lookup helpers =====================
 
 def _lookup_metric_with_context(comp, metric, period):
@@ -124,6 +201,8 @@ def _lookup_metric_with_context(comp, metric, period):
         "prev_value": ... or None,
         "latest_period": ... or None,
         "latest_value": ... or None,
+        "valid_cols": [...],
+        "row": pandas.Series-like row,
       }
     or None if metric not found.
     """
@@ -226,15 +305,177 @@ def _lookup_multiple_metrics_contexts(comp, metrics, period):
     return out
 
 
+# ===================== Cross-metric expert analysis =====================
+
+def _interpret_margin(name, margin):
+    """Simple heuristic interpretation for a % margin."""
+    if margin is None:
+        return ""
+    if margin >= 25:
+        return f"{name} is exceptionally strong."
+    elif margin >= 15:
+        return f"{name} is strong and healthy."
+    elif margin >= 8:
+        return f"{name} is moderate and acceptable."
+    elif margin >= 3:
+        return f"{name} is thin; profitability is sensitive to cost pressures."
+    else:
+        return f"{name} is very weak and indicates limited pricing power or high costs."
+
+
+def _interpret_roe(roe):
+    if roe is None:
+        return ""
+    if roe >= 25:
+        return "ROE is excellent, reflecting very strong value creation for shareholders."
+    elif roe >= 15:
+        return "ROE is solid and attractive in most markets."
+    elif roe >= 10:
+        return "ROE is reasonable but not outstanding."
+    else:
+        return "ROE is weak and suggests limited return on equity capital."
+
+
+def _interpret_roa(roa):
+    if roa is None:
+        return ""
+    if roa >= 10:
+        return "ROA is outstanding given the asset base."
+    elif roa >= 5:
+        return "ROA is healthy and indicates efficient use of assets."
+    elif roa >= 2:
+        return "ROA is modest but acceptable for some capital-intensive sectors."
+    else:
+        return "ROA is low, suggesting heavy assets relative to profit."
+
+
+def _interpret_leverage(leverage):
+    if leverage is None:
+        return ""
+    if leverage <= 0.5:
+        return "Balance sheet is very conservative with low leverage."
+    elif leverage <= 1.5:
+        return "Leverage is moderate and generally comfortable."
+    elif leverage <= 2.5:
+        return "Leverage is on the higher side and needs monitoring."
+    else:
+        return "Leverage is aggressive; the company is highly dependent on debt."
+
+
+def _interpret_cash_conversion(conv):
+    if conv is None:
+        return ""
+    if conv >= 1.2:
+        return "Cash conversion is excellent; cash generation exceeds accounting profit."
+    elif conv >= 0.9:
+        return "Cash conversion is healthy; most profit is converting into cash."
+    elif conv >= 0.6:
+        return "Cash conversion is moderate; watch working capital and cash leakage."
+    else:
+        return "Cash conversion is weak; there may be collection, working capital, or quality-of-earnings issues."
+
+
+def _build_cross_metric_snapshot(tick, period, comp, role_index):
+    """
+    Build cross-metric ratios (margins, ROE, ROA, leverage, cash conversion)
+    for the given period using role_index.
+    Returns list of text lines, or empty list if nothing computed.
+    """
+    lines = []
+
+    # Base values
+    sales_val, sales = _get_role_value(comp, role_index, "sales", period)
+    pat_val, pat = _get_role_value(comp, role_index, "pat", period)
+    gp_val, gp = _get_role_value(comp, role_index, "gross_profit", period)
+    pbt_val, pbt = _get_role_value(comp, role_index, "pbt", period)
+    eq_val, eq = _get_role_value(comp, role_index, "equity", period)
+    ta_val, ta = _get_role_value(comp, role_index, "total_assets", period)
+    tl_val, tl = _get_role_value(comp, role_index, "total_liabilities", period)
+    cfo_val, cfo = _get_role_value(comp, role_index, "cfo", period)
+
+    # Margins
+    if sales not in (None, 0):
+        # Gross margin
+        gross_margin = None
+        if gp is not None:
+            gross_margin = gp / sales * 100
+            lines.append(
+                f"- Gross margin ≈ {gross_margin:,.1f}% "
+                f"(Gross Profit {gp_val} / Sales {sales_val}). "
+                f"{_interpret_margin('Gross margin', gross_margin)}"
+            )
+
+        # PBT margin
+        if pbt is not None:
+            pbt_margin = pbt / sales * 100
+            lines.append(
+                f"- PBT margin ≈ {pbt_margin:,.1f}% "
+                f"(PBT {pbt_val} / Sales {sales_val}). "
+                f"{_interpret_margin('PBT margin', pbt_margin)}"
+            )
+
+        # Net margin (PAT)
+        if pat is not None:
+            net_margin = pat / sales * 100
+            lines.append(
+                f"- Net margin ≈ {net_margin:,.1f}% "
+                f"(Profit after Taxation {pat_val} / Sales {sales_val}). "
+                f"{_interpret_margin('Net margin', net_margin)}"
+            )
+
+    # ROE
+    if pat is not None and eq not in (None, 0):
+        roe = pat / eq * 100
+        lines.append(
+            f"- Return on Equity (ROE) ≈ {roe:,.1f}% "
+            f"(Profit after Taxation {pat_val} / Equity {eq_val}). "
+            f"{_interpret_roe(roe)}"
+        )
+
+    # ROA
+    if pat is not None and ta not in (None, 0):
+        roa = pat / ta * 100
+        lines.append(
+            f"- Return on Assets (ROA) ≈ {roa:,.1f}% "
+            f"(Profit after Taxation {pat_val} / Total Assets {ta_val}). "
+            f"{_interpret_roa(roa)}"
+        )
+
+    # Leverage
+    if tl is not None and eq not in (None, 0):
+        leverage = tl / eq
+        lines.append(
+            f"- Leverage (Liabilities / Equity) ≈ {leverage:,.2f}x "
+            f"(Total Liabilities {tl_val} / Equity {eq_val}). "
+            f"{_interpret_leverage(leverage)}"
+        )
+
+    # Cash conversion
+    if cfo is not None and pat not in (None, 0):
+        conv = cfo / pat
+        lines.append(
+            f"- Cash conversion (CFO / PAT) ≈ {conv:,.2f}x "
+            f"(Cash from Operation {cfo_val} / Profit after Taxation {pat_val}). "
+            f"{_interpret_cash_conversion(conv)}"
+        )
+
+    if lines:
+        header = f"Cross-metric snapshot for {tick} in {period}:"
+        return [header] + lines
+
+    return []
+
+
 # ===================== Formatting helpers =====================
 
-def _format_single_metric_answer(tick, metric, ctx, comp):
+def _format_single_metric_answer(tick, metric, ctx, comp, role_index):
     """
     Human-friendly answer with analysis:
     - value in requested year,
     - comparison vs previous year,
     - comparison vs latest year (e.g., 2025),
-    - multi-year trend view (CAGR and where this year sits in history).
+    - multi-year trend view (CAGR and where this year sits in history),
+    - cross-metric ratios (margins, ROE, ROA, leverage, cash conversion).
     """
     period = ctx["period"]
     value = ctx["value"]
@@ -326,7 +567,6 @@ def _format_single_metric_answer(tick, metric, ctx, comp):
         max_val = max(values_sorted)
 
         # Where does the current value sit vs history?
-        position_comment = None
         if max_val == min_val:
             position_comment = "is broadly in line with its historical range."
         else:
@@ -347,14 +587,19 @@ def _format_single_metric_answer(tick, metric, ctx, comp):
                 f"The implied compound annual growth rate (CAGR) over this period "
                 f"is approximately {cagr * 100:,.1f}%."
             )
-        if position_comment:
-            expert_lines.append(
-                f"The {period} figure {position_comment}"
-            )
+        expert_lines.append(
+            f"The {period} figure {position_comment}"
+        )
 
         lines.append("")
         lines.append("Expert view:")
         lines.append(" ".join(expert_lines))
+
+    # --- Cross-metric ratios (true expert snapshot) ---
+    cross_lines = _build_cross_metric_snapshot(tick, period, comp, role_index)
+    if cross_lines:
+        lines.append("")
+        lines.extend(cross_lines)
 
     return "\n".join(lines)
 
@@ -427,7 +672,8 @@ def answer_query(query, companies):
         * value,
         * change vs previous year,
         * change vs latest year (e.g., 2025),
-        * multi-year expert commentary.
+        * multi-year expert commentary,
+        * cross-metric ratios (margins, ROE, ROA, leverage, cash conversion).
     - Otherwise, extract keywords from the query (e.g. 'assets', 'profit', 'cash')
       and return ALL metrics whose names contain those keywords, each with trend vs
       previous year and latest year.
@@ -449,13 +695,14 @@ def answer_query(query, companies):
     metrics = comp.get("metrics", [])
 
     period = _detect_period(query, periods)
+    role_index = _build_role_index(comp)
 
     # --------- First: precise metric phrase ---------
     precise_metric = _find_precise_metric(query, metrics)
     if precise_metric:
         ctx = _lookup_metric_with_context(comp, precise_metric, period)
         if ctx is not None:
-            return _format_single_metric_answer(tick, precise_metric, ctx, comp)
+            return _format_single_metric_answer(tick, precise_metric, ctx, comp, role_index)
 
     # --------- Second: keyword-based multi-metric ---------
     keywords = _extract_keywords(query, tick)
@@ -480,10 +727,10 @@ def answer_query(query, companies):
     if keyword_metrics:
         metric_contexts = _lookup_multiple_metrics_contexts(comp, keyword_metrics, period)
         if metric_contexts:
-            # If only one metric matched, behave like single metric
+            # If only one metric matched, behave like single metric (with full expert view)
             if len(metric_contexts) == 1:
                 m, ctx = metric_contexts[0]
-                return _format_single_metric_answer(tick, m, ctx, comp)
+                return _format_single_metric_answer(tick, m, ctx, comp, role_index)
             # Otherwise bullets
             return _format_multi_metric_answer(tick, keywords, metric_contexts, period)
 
@@ -505,4 +752,4 @@ def answer_query(query, companies):
     if ctx is None:
         return "Value not found."
 
-    return _format_single_metric_answer(tick, best, ctx, comp)
+    return _format_single_metric_answer(tick, best, ctx, comp, role_index)
