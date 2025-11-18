@@ -58,7 +58,7 @@ def _extract_keywords(query, ticker):
     stopwords = {
         "of", "the", "in", "for", "and", "to", "from", "at",
         "on", "is", "are", "was", "were", "this", "that",
-        "year", "years", "value", "what", "tell", "me"
+        "year", "years", "value", "what", "tell", "me", "overview", "snapshot", "summary"
     }
 
     ticker_lower = str(ticker).lower() if ticker else ""
@@ -202,7 +202,7 @@ def _lookup_metric_with_context(comp, metric, period):
         "latest_period": ... or None,
         "latest_value": ... or None,
         "valid_cols": [...],
-        "row": pandas.Series-like row,
+        "row": pandas.DataFrame row,
       }
     or None if metric not found.
     """
@@ -305,7 +305,25 @@ def _lookup_multiple_metrics_contexts(comp, metrics, period):
     return out
 
 
-# ===================== Cross-metric expert analysis =====================
+def _default_period_from_company(comp):
+    """
+    If user does not specify a year in overview, pick the latest available period.
+    """
+    periods = comp.get("periods", [])
+    if not periods:
+        return None
+
+    # Try numeric sort if possible
+    def _key(p):
+        try:
+            return int(p)
+        except Exception:
+            return p
+
+    return sorted(periods, key=_key)[-1]
+
+
+# ===================== Cross-metric expert analysis helpers =====================
 
 def _interpret_margin(name, margin):
     """Simple heuristic interpretation for a % margin."""
@@ -396,7 +414,6 @@ def _build_cross_metric_snapshot(tick, period, comp, role_index):
     # Margins
     if sales not in (None, 0):
         # Gross margin
-        gross_margin = None
         if gp is not None:
             gross_margin = gp / sales * 100
             lines.append(
@@ -466,7 +483,118 @@ def _build_cross_metric_snapshot(tick, period, comp, role_index):
     return []
 
 
-# ===================== Formatting helpers =====================
+# ===================== Company snapshot (overview) =====================
+
+def _build_company_snapshot_text(tick, period, comp, role_index):
+    """
+    Build a compact analyst-style overview for a company in a given period.
+    Includes: sales growth, PAT, margins, ROE, leverage, cash conversion.
+    """
+    if period is None:
+        period = _default_period_from_company(comp)
+
+    if period is None:
+        return "No period information available for overview."
+
+    # Get base role values and contexts
+    sales_metric = role_index.get("sales")
+    pat_metric = role_index.get("pat")
+
+    sales_ctx = _lookup_metric_with_context(comp, sales_metric, period) if sales_metric else None
+    pat_ctx = _lookup_metric_with_context(comp, pat_metric, period) if pat_metric else None
+
+    sales_val = sales_num = None
+    if sales_ctx:
+        sales_val = sales_ctx["value"]
+        sales_num = _to_number(sales_val)
+
+    pat_val = pat_num = None
+    if pat_ctx:
+        pat_val = pat_ctx["value"]
+        pat_num = _to_number(pat_val)
+
+    # Header
+    lines = [f"{tick} – {period} Financial Overview"]
+
+    # ---------- 1) Top-line & earnings ----------
+    top_line_sentences = []
+
+    # Sales YoY and CAGR
+    if sales_ctx and sales_num is not None:
+        prev_p = sales_ctx["prev_period"]
+        prev_v = sales_ctx["prev_value"]
+        prev_n = _to_number(prev_v) if prev_p is not None else None
+
+        if prev_p is not None and prev_n not in (None, 0):
+            diff = sales_num - prev_n
+            pct = diff / abs(prev_n) * 100
+            direction = "grew" if diff > 0 else "declined" if diff < 0 else "was flat"
+            top_line_sentences.append(
+                f"Sales in {period} were {sales_val}, which {direction} by {abs(pct):.1f}% versus {prev_p}."
+            )
+        else:
+            top_line_sentences.append(
+                f"Sales in {period} were {sales_val}."
+            )
+
+        # Multi-year sales CAGR
+        series_sales = _get_metric_series(comp, sales_metric)
+        series_nums = {
+            p: _to_number(v)
+            for p, v in series_sales.items()
+            if _to_number(v) is not None
+        }
+        if series_nums and len(series_nums) >= 2:
+            def _key(p):
+                try:
+                    return int(p)
+                except Exception:
+                    return p
+
+            sorted_items = sorted(series_nums.items(), key=lambda x: _key(x[0]))
+            first_p, first_v = sorted_items[0]
+            last_p, last_v = sorted_items[-1]
+            if first_v not in (None, 0):
+                n_years = len(sorted_items) - 1
+                if n_years > 0:
+                    cagr = (last_v / abs(first_v)) ** (1 / n_years) - 1
+                    top_line_sentences.append(
+                        f"Over {first_p}–{last_p}, sales have grown at an approximate CAGR of {cagr*100:.1f}%."
+                    )
+
+    # PAT YoY
+    if pat_ctx and pat_num is not None:
+        prev_p = pat_ctx["prev_period"]
+        prev_v = pat_ctx["prev_value"]
+        prev_n = _to_number(prev_v) if prev_p is not None else None
+
+        if prev_p is not None and prev_n not in (None, 0):
+            diff = pat_num - prev_n
+            pct = diff / abs(prev_n) * 100
+            direction = "increased" if diff > 0 else "decreased" if diff < 0 else "was broadly unchanged"
+            top_line_sentences.append(
+                f"Profit after taxation in {period} was {pat_val}, which {direction} by {abs(pct):.1f}% versus {prev_p}."
+            )
+        else:
+            top_line_sentences.append(
+                f"Profit after taxation in {period} stood at {pat_val}."
+            )
+
+    if top_line_sentences:
+        lines.append("")
+        lines.append("Headline performance:")
+        lines.append(" ".join(top_line_sentences))
+
+    # ---------- 2) Profitability, returns, leverage, cash ----------
+    cross_lines = _build_cross_metric_snapshot(tick, period, comp, role_index)
+    if cross_lines:
+        lines.append("")
+        lines.extend(cross_lines)
+
+    return "\n".join(lines)
+
+
+# ===================== Formatting helpers for metric-based answers =====================
 
 def _format_single_metric_answer(tick, metric, ctx, comp, role_index):
     """
@@ -666,18 +794,21 @@ def answer_query(query, companies):
     Main Q&A function.
 
     Behaviour:
-    - Detect ticker and period.
-    - If query contains a precise metric phrase (e.g. 'Total Assets', 'Profit after Taxation'),
-      return that single metric with:
-        * value,
-        * change vs previous year,
-        * change vs latest year (e.g., 2025),
-        * multi-year expert commentary,
-        * cross-metric ratios (margins, ROE, ROA, leverage, cash conversion).
-    - Otherwise, extract keywords from the query (e.g. 'assets', 'profit', 'cash')
-      and return ALL metrics whose names contain those keywords, each with trend vs
-      previous year and latest year.
-    - If still nothing useful, fall back to fuzzy best-match metric with trend.
+    - If query looks like 'overview/snapshot/summary of TICKER YEAR':
+        => Return a company-level mini-report:
+           * sales & PAT with YoY and multi-year sales CAGR,
+           * margins, ROE, ROA, leverage, cash-conversion (cross-metric view).
+    - Otherwise:
+        - If query contains a precise metric phrase (e.g. 'Total Assets', 'Profit after Taxation'),
+          return that single metric with:
+            * value,
+            * change vs previous year,
+            * change vs latest year,
+            * multi-year expert commentary,
+            * cross-metric ratios.
+        - Else, extract keywords (e.g. 'assets', 'profit', 'cash') and return all matching
+          metrics with trend vs previous & latest years.
+        - Else, fall back to fuzzy best-match metric with trend and expert view.
     """
     if not query:
         return "Empty query."
@@ -696,6 +827,12 @@ def answer_query(query, companies):
 
     period = _detect_period(query, periods)
     role_index = _build_role_index(comp)
+
+    q_lower = str(query).lower()
+
+    # --------- Special mode: company snapshot / overview ---------
+    if any(k in q_lower for k in ["overview", "snapshot", "summary", "company view"]):
+        return _build_company_snapshot_text(tick, period, comp, role_index)
 
     # --------- First: precise metric phrase ---------
     precise_metric = _find_precise_metric(query, metrics)
