@@ -488,6 +488,131 @@ def _build_cross_metric_snapshot(tick, period, comp, role_index):
 
 # ===================== PSX DPS live scraper =====================
 
+def _fetch_psx_overview(ticker):
+    """
+    Fetch latest price, free float %, EPS by year, and latest payout
+    from https://dps.psx.com.pk/company/{ticker} by parsing the HTML text.
+
+    Returns dict:
+      {
+        "price": "560.45",
+        "free_float_pct": "40.00%",
+        "eps_by_year": {"2025": "41.92", "2024": "(4.54)", ...},
+        "latest_payout": {"date": "...", "details": "...", "book_closure": "..."},
+        "source_url": url,
+      }
+    or None on failure.
+    """
+    url = f"https://dps.psx.com.pk/company/{ticker}"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+    except Exception:
+        return None
+
+    html = resp.text
+
+    # ---------- Latest price ----------
+    price = None
+    m_price = re.search(r"Rs\.\s*([\d,]+\.\d+)", html)
+    if m_price:
+        price = m_price.group(1)
+
+    # ---------- Free float % ----------
+    free_float_pct = None
+    # capture last % value that appears after the words "Free Float"
+    ff_matches = re.findall(r"Free\s*Float.*?([\d,.]+\s*%)", html, flags=re.I | re.S)
+    if ff_matches:
+        free_float_pct = ff_matches[-1].strip()
+
+    # ---------- EPS (Annual financials) ----------
+    eps_by_year = {}
+
+    try:
+        # isolate Financials block
+        fin_section = html.split("# Financials", 1)[1]
+    except Exception:
+        fin_section = ""
+
+    # restrict to between "Annual" and "Quarterly" (annual table)
+    annual_block = fin_section
+    if "Annual" in annual_block:
+        annual_block = annual_block.split("Annual", 1)[1]
+    if "Quarterly" in annual_block:
+        annual_block = annual_block.split("Quarterly", 1)[0]
+
+    # years row: pattern like "2025 2024 2023 2022"
+    years = []
+    m_years = re.search(
+        r"((?:19|20)\d{2}(?:\s+(?:19|20)\d{2})+)", annual_block
+    )
+    if m_years:
+        years = m_years.group(1).split()
+
+    # EPS row: everything on the line after the word "EPS"
+    m_eps = re.search(r"EPS\s+([^\n\r#]+)", annual_block)
+    if m_eps and years:
+        eps_segment = m_eps.group(1)
+        # capture tokens like 41.92, (4.54), 1.12, 1.77
+        vals_raw = re.findall(r"\(?[-\d.,]+\)?", eps_segment)
+        for y, v in zip(years, vals_raw):
+            eps_by_year[y] = v.strip()
+
+    # ---------- Latest payout (Payouts section) ----------
+    latest_payout = None
+    try:
+        payout_section = html.split("# Payouts", 1)[1]
+        # limit to before "Financial Reports" block if present
+        if "# Financial Reports" in payout_section:
+            payout_section = payout_section.split("# Financial Reports", 1)[0]
+    except Exception:
+        payout_section = ""
+
+    # first data row typically like:
+    # "September 29, 2025 4:41 PM 30/06/2025(YR) 100%(F) (D) 17/10/2025 - 25/10/2025"
+    m_row = re.search(
+        r"([A-Za-z]+\s+\d{1,2},\s+\d{4}[^#\n\r]+)",
+        payout_section
+    )
+    if m_row:
+        row = m_row.group(1).strip()
+
+        # split out date (with optional time)
+        m_date = re.match(
+            r"([A-Za-z]+\s+\d{1,2},\s+\d{4}(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)?)?)\s+(.*)",
+            row
+        )
+        if m_date:
+            date_str = m_date.group(1).strip()
+            rest = m_date.group(2).strip()
+        else:
+            date_str = None
+            rest = row
+
+        # book closure range like "17/10/2025 - 25/10/2025"
+        m_bc = re.search(
+            r"(\d{2}/\d{2}/\d{4}\s*-\s*\d{2}/\d{2}/\d{4})",
+            rest
+        )
+        book_closure = m_bc.group(1).strip() if m_bc else None
+
+        details = rest
+        if book_closure:
+            details = details.replace(book_closure, "").strip()
+
+        latest_payout = {
+            "date": date_str,
+            "details": details,
+            "book_closure": book_closure,
+        }
+
+    return {
+        "price": price,
+        "free_float_pct": free_float_pct,
+        "eps_by_year": eps_by_year,
+        "latest_payout": latest_payout,
+        "source_url": url,
+    }
 
 
 
