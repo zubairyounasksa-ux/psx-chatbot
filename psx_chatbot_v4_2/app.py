@@ -77,7 +77,7 @@ else:
     st.write("### Companies Available:")
     st.write(", ".join(sorted(companies.keys())))
 
-    query = st.text_input("Ask a question (e.g., 'Net profit of GAL 2023')")
+    query = st.text_input("Ask a question ")
 
     if query:
         st.write("### Answer")
