@@ -1,4 +1,5 @@
 from fuzzywuzzy import fuzz
+import re
 
 
 def best_match(query, options, threshold=50):
@@ -18,10 +19,7 @@ def best_match(query, options, threshold=50):
     q = str(query).lower()
 
     # Normalise all options as strings
-    norm_options = []
-    for opt in options:
-        opt_str = str(opt)
-        norm_options.append(opt_str)
+    norm_options = [str(opt) for opt in options]
 
     # --- 1) Exact phrase matches ---
     phrase_matches = []
@@ -29,7 +27,6 @@ def best_match(query, options, threshold=50):
         o = opt_str.lower().strip()
         if not o:
             continue
-        # If the full metric/period text appears in the query, treat as phrase match
         if o in q:
             phrase_matches.append(opt_str)
 
@@ -59,7 +56,7 @@ def best_match(query, options, threshold=50):
 def _lookup_single_metric_value(comp, metric, period):
     """
     Helper to look up one metric for a given company and (optional) period.
-    Returns (value or None).
+    Returns the value or None.
     """
     if not metric:
         return None
@@ -95,13 +92,43 @@ def _lookup_multiple_metrics_values(comp, metrics, period):
     return results
 
 
+def _extract_keywords(query, ticker):
+    """
+    Extract significant alphabetic tokens from the query,
+    removing the ticker and common stopwords.
+    """
+    q_lower = str(query).lower()
+    words = re.findall(r"[a-zA-Z]+", q_lower)
+
+    stopwords = {
+        "of", "the", "in", "for", "and", "to", "from", "at",
+        "on", "is", "are", "was", "were", "this", "that",
+        "year", "years", "value"
+    }
+
+    ticker_lower = str(ticker).lower() if ticker else ""
+    keywords = []
+    for w in words:
+        if len(w) < 3:
+            continue
+        if w in stopwords:
+            continue
+        if ticker_lower and w == ticker_lower.lower():
+            continue
+        keywords.append(w)
+
+    return keywords
+
+
 def answer_query(query, companies):
     """
     Main Q&A function.
 
     - Detects ticker from query words (e.g., 'GAL', 'SAZEW').
-    - If query is generic 'profit', returns all profit-related metrics.
-    - Otherwise uses best_match() to find the most relevant metric and period.
+    - If query is vague (e.g., 'assets', 'profit', 'cash'), return all metrics
+      containing those keywords for the selected period.
+    - If query contains a precise metric phrase (e.g., 'profit after taxation'),
+      return just that metric.
     """
     if not query:
         return "Empty query."
@@ -110,11 +137,11 @@ def answer_query(query, companies):
         return "No companies loaded."
 
     # --- Detect ticker from query words ---
-    words = str(query).upper().split()
+    words_upper = str(query).upper().split()
     tick = None
 
     for t in companies:
-        if t.upper() in words:
+        if t.upper() in words_upper:
             tick = t
             break
 
@@ -126,39 +153,64 @@ def answer_query(query, companies):
         return "No company ticker detected in query."
 
     comp = companies[tick]
-    q_lower = query.lower()
+    q_lower = str(query).lower()
 
     # --- Detect period (year etc.) once ---
     period = best_match(query, comp.get("periods", []), threshold=40)
 
-    # -------------------------------------------------
-    # SPECIAL CASE: generic "profit" query
-    # -------------------------------------------------
-    # If user says just "profit" without specifying gross/before/after/net/tax,
-    # show ALL profit-related metrics for that period.
-    generic_profit = (
-        "profit" in q_lower
-        and not any(w in q_lower for w in ["gross", "before", "after", "tax", "taxation", "operating", "net"])
+    metrics = comp.get("metrics", [])
+
+    # --- Try to find a precise metric phrase first ---
+    precise_metric = best_match(query, metrics, threshold=50)
+    is_precise = (
+        precise_metric is not None
+        and precise_metric.lower().strip() in q_lower
+        and len(precise_metric.split()) > 1  # multi-word metric like "Total Assets"
     )
 
-    if generic_profit:
-        all_metrics = comp.get("metrics", [])
-        profit_metrics = [m for m in all_metrics if "profit" in str(m).lower()]
+    if is_precise:
+        val = _lookup_single_metric_value(comp, precise_metric, period)
+        if val is not None:
+            if period:
+                return f"{tick} – {precise_metric} in {period}: {val}"
+            return f"{tick} – {precise_metric}: {val}"
 
-        if profit_metrics:
-            results = _lookup_multiple_metrics_values(comp, profit_metrics, period)
+    # -------------------------------------------------
+    # Generic keyword logic: show all matching metrics
+    # -------------------------------------------------
+    keywords = _extract_keywords(query, tick)
+
+    keyword_metrics = set()
+    for m in metrics:
+        m_low = str(m).lower()
+        for kw in keywords:
+            if kw in m_low:
+                keyword_metrics.add(m)
+                break
+
+    if keyword_metrics:
+        # If we only have one good match, behave like a normal single answer
+        if len(keyword_metrics) == 1:
+            metric = next(iter(keyword_metrics))
+            val = _lookup_single_metric_value(comp, metric, period)
+            if val is not None:
+                if period:
+                    return f"{tick} – {metric} in {period}: {val}"
+                return f"{tick} – {metric}: {val}"
+        else:
+            # Multiple matches -> show a small list
+            results = _lookup_multiple_metrics_values(comp, keyword_metrics, period)
             if results:
                 period_text = f" in {period}" if period else ""
-                lines = [f"{tick} – metrics related to 'profit'{period_text}:"]
-                for m, v in results:
+                lines = [f"{tick} – metrics related to {', '.join(keywords)}{period_text}:"]
+                for m, v in sorted(results, key=lambda x: str(x[0])):
                     lines.append(f"- {m}: {v}")
                 return "\n".join(lines)
-            # If somehow no values found, fall back to normal logic
 
     # -------------------------------------------------
-    # NORMAL CASE: precise metric
+    # Final fallback: generic fuzzy best_match
     # -------------------------------------------------
-    metric = best_match(query, comp.get("metrics", []), threshold=50)
+    metric = best_match(query, metrics, threshold=45)
     if not metric:
         return "Metric not found."
 
