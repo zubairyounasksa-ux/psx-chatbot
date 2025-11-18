@@ -2,7 +2,7 @@ from fuzzywuzzy import fuzz
 import re
 
 
-# ===================== Low-level helpers =====================
+# ===================== Detection helpers =====================
 
 def _detect_ticker(query, companies):
     """Find ticker from query words, or default if only one company."""
@@ -112,9 +112,9 @@ def _to_number(val):
 
 # ===================== Data lookup helpers =====================
 
-def _lookup_metric_with_neighbors(comp, metric, period):
+def _lookup_metric_with_context(comp, metric, period):
     """
-    Look up a metric value and also previous/next period values.
+    Look up a metric value and also previous + latest year values.
 
     Returns dict:
       {
@@ -122,8 +122,8 @@ def _lookup_metric_with_neighbors(comp, metric, period):
         "value": current_value,
         "prev_period": ... or None,
         "prev_value": ... or None,
-        "next_period": ... or None,
-        "next_value": ... or None,
+        "latest_period": ... or None,
+        "latest_value": ... or None,
       }
     or None if metric not found.
     """
@@ -148,33 +148,35 @@ def _lookup_metric_with_neighbors(comp, metric, period):
         if not valid_cols:
             continue
 
-        # Decide which period column to use
+        # Which period to use:
+        # - if user gave a year and it's present, use that
+        # - otherwise use the latest year (rightmost column)
         if period and period in valid_cols:
             used_period = period
         else:
-            # fallback: first available column
-            used_period = valid_cols[0]
+            used_period = valid_cols[-1]  # default = latest year
 
         if used_period not in df.columns:
             continue
 
         cur_val = row[used_period].values[0]
 
-        # find neighbours based on column order
+        # previous year (immediately before used_period)
         idx = valid_cols.index(used_period)
         prev_col = valid_cols[idx - 1] if idx > 0 else None
-        next_col = valid_cols[idx + 1] if idx + 1 < len(valid_cols) else None
-
         prev_val = row[prev_col].values[0] if prev_col else None
-        next_val = row[next_col].values[0] if next_col else None
+
+        # latest year in the sheet (e.g., 2025)
+        latest_col = valid_cols[-1]
+        latest_val = row[latest_col].values[0]
 
         return {
             "period": used_period,
             "value": cur_val,
             "prev_period": prev_col,
             "prev_value": prev_val,
-            "next_period": next_col,
-            "next_value": next_val,
+            "latest_period": latest_col,
+            "latest_value": latest_val,
         }
 
     return None
@@ -183,11 +185,11 @@ def _lookup_metric_with_neighbors(comp, metric, period):
 def _lookup_multiple_metrics_contexts(comp, metrics, period):
     """
     For a list of metrics, return list of (metric, context_dict) where context_dict
-    is from _lookup_metric_with_neighbors.
+    is from _lookup_metric_with_context.
     """
     out = []
     for m in metrics:
-        ctx = _lookup_metric_with_neighbors(comp, m, period)
+        ctx = _lookup_metric_with_context(comp, m, period)
         if ctx is not None:
             out.append((m, ctx))
     return out
@@ -196,21 +198,26 @@ def _lookup_multiple_metrics_contexts(comp, metrics, period):
 # ===================== Formatting helpers =====================
 
 def _format_single_metric_answer(tick, metric, ctx):
-    """Human-friendly answer with trend commentary for one metric."""
+    """
+    Human-friendly answer with analysis:
+    - value in requested year,
+    - comparison vs previous year,
+    - comparison vs latest year (e.g., 2025).
+    """
     period = ctx["period"]
     value = ctx["value"]
     prev_period = ctx["prev_period"]
     prev_value = ctx["prev_value"]
-    next_period = ctx["next_period"]
-    next_value = ctx["next_value"]
+    latest_period = ctx["latest_period"]
+    latest_value = ctx["latest_value"]
 
     val_num = _to_number(value)
     prev_num = _to_number(prev_value) if prev_period is not None else None
-    next_num = _to_number(next_value) if next_period is not None else None
+    latest_num = _to_number(latest_value) if latest_period is not None else None
 
     lines = [f"{tick} – {metric} in {period}: {value}"]
 
-    # Compare with previous
+    # Compare with previous year
     if prev_period is not None and prev_value is not None:
         if val_num is not None and prev_num not in (None, 0):
             diff = val_num - prev_num
@@ -221,6 +228,7 @@ def _format_single_metric_answer(tick, metric, ctx):
                 direction = "decreased"
             else:
                 direction = "remained almost flat"
+
             lines.append(
                 f"Compared to {prev_period}, it {direction} by "
                 f"{abs(diff):,.2f} ({abs(pct):.1f}%). Previous value: {prev_value}."
@@ -228,24 +236,26 @@ def _format_single_metric_answer(tick, metric, ctx):
         else:
             lines.append(f"Previous period {prev_period}: {prev_value}.")
 
-    # Compare with next
-    if next_period is not None and next_value is not None and val_num is not None and next_num is not None:
-        diff_n = next_num - val_num
-        pct_n = diff_n / abs(val_num) * 100 if val_num != 0 else None
-        if diff_n > 0:
-            direction_n = "further increased"
-        elif diff_n < 0:
-            direction_n = "declined"
-        else:
-            direction_n = "stayed at the same level"
-        if pct_n is not None:
+    # Compare with latest year (e.g., 2025)
+    if latest_period is not None and latest_period != period and latest_value is not None:
+        if latest_num is not None and val_num not in (None, 0):
+            diff_l = latest_num - val_num
+            pct_l = diff_l / abs(val_num) * 100
+            if diff_l > 0:
+                dir_l = "higher"
+            elif diff_l < 0:
+                dir_l = "lower"
+            else:
+                dir_l = "at the same level"
+
             lines.append(
-                f"In {next_period}, it {direction_n} to {next_value} "
-                f"(change of {abs(diff_n):,.2f}, {abs(pct_n):.1f}% vs {period})."
+                f"Relative to the latest reported year {latest_period}, "
+                f"the value in {period} is {dir_l} by "
+                f"{abs(diff_l):,.2f} ({abs(pct_l):.1f}%). Latest value: {latest_value}."
             )
         else:
             lines.append(
-                f"In {next_period}, reported value is {next_value}."
+                f"Latest reported year {latest_period} has value {latest_value}."
             )
 
     return "\n".join(lines)
@@ -253,7 +263,7 @@ def _format_single_metric_answer(tick, metric, ctx):
 
 def _format_multi_metric_answer(tick, keywords, metric_contexts, period):
     """
-    Short bullet summary when many metrics match a keyword (e.g. 'assets').
+    Bullet summary when many metrics match a keyword (e.g. 'assets', 'profit').
     """
     kw_text = ", ".join(sorted(set(keywords)))
     period_text = f" in {period}" if period else ""
@@ -264,11 +274,16 @@ def _format_multi_metric_answer(tick, keywords, metric_contexts, period):
         value = ctx["value"]
         prev_period = ctx["prev_period"]
         prev_value = ctx["prev_value"]
+        latest_period = ctx["latest_period"]
+        latest_value = ctx["latest_value"]
 
         val_num = _to_number(value)
         prev_num = _to_number(prev_value) if prev_period is not None else None
+        latest_num = _to_number(latest_value) if latest_period is not None else None
 
         line = f"- {metric} in {period_m}: {value}"
+
+        # vs previous
         if prev_period is not None and val_num is not None and prev_num not in (None, 0):
             diff = val_num - prev_num
             pct = diff / abs(prev_num) * 100
@@ -281,6 +296,19 @@ def _format_multi_metric_answer(tick, keywords, metric_contexts, period):
             line += f" ({arrow} vs {prev_period}: {abs(pct):.1f}%)."
         elif prev_period is not None and prev_value is not None:
             line += f" (previous {prev_period}: {prev_value})."
+
+        # vs latest
+        if latest_period is not None and latest_period != period_m and latest_value is not None and val_num not in (None, 0):
+            if latest_num not in (None, 0):
+                diff_l = latest_num - val_num
+                pct_l = diff_l / abs(val_num) * 100
+                if diff_l > 0:
+                    arrow2 = "↑"
+                elif diff_l < 0:
+                    arrow2 = "↓"
+                else:
+                    arrow2 = "→"
+                line += f" Latest {latest_period}: {latest_value} ({arrow2} {abs(pct_l):.1f}% vs {period_m})."
 
         lines.append(line)
 
@@ -296,9 +324,13 @@ def answer_query(query, companies):
     Behaviour:
     - Detect ticker and period.
     - If query contains a precise metric phrase (e.g. 'Total Assets', 'Profit after Taxation'),
-      return that single metric with comparison to previous / next year.
+      return that single metric with:
+        * value,
+        * change vs previous year,
+        * change vs latest year (e.g., 2025).
     - Otherwise, extract keywords from the query (e.g. 'assets', 'profit', 'cash')
-      and return ALL metrics whose names contain those keywords, each with trend vs previous year.
+      and return ALL metrics whose names contain those keywords, each with trend vs
+      previous year and latest year.
     - If still nothing useful, fall back to fuzzy best-match metric with trend.
     """
     if not query:
@@ -321,7 +353,7 @@ def answer_query(query, companies):
     # --------- First: precise metric phrase ---------
     precise_metric = _find_precise_metric(query, metrics)
     if precise_metric:
-        ctx = _lookup_metric_with_neighbors(comp, precise_metric, period)
+        ctx = _lookup_metric_with_context(comp, precise_metric, period)
         if ctx is not None:
             return _format_single_metric_answer(tick, precise_metric, ctx)
 
@@ -369,7 +401,7 @@ def answer_query(query, companies):
     if not best or best_score < 45:
         return "Metric not found."
 
-    ctx = _lookup_metric_with_neighbors(comp, best, period)
+    ctx = _lookup_metric_with_context(comp, best, period)
     if ctx is None:
         return "Value not found."
 
