@@ -3,7 +3,7 @@ import zipfile
 import tempfile
 from pathlib import Path
 
-import pandas as pd  # optional, but fine to keep
+import pandas as pd  # optional
 from utils.loader import load_company_zip
 from utils.engine import answer_query
 
@@ -12,7 +12,7 @@ from utils.engine import answer_query
 # Page config
 # -------------------------------------------------
 st.set_page_config(
-    page_title="PSX Chatbot V4.2",
+    page_title="Youngs Capital PSX Chatbot V1.00",
     layout="wide"
 )
 
@@ -26,7 +26,6 @@ if theme_path.exists():
     with open(theme_path, "r", encoding="utf-8") as f:
         css = f.read()
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
-# If file does not exist, app will still run without crashing.
 
 # Folder where backend ZIPs live (inside the repo)
 DATA_DIR = BASE_DIR / "data"
@@ -77,8 +76,51 @@ else:
     st.write("### Companies Available:")
     st.write(", ".join(sorted(companies.keys())))
 
-    query = st.text_input("Ask a question ")
+    # ----------------- Mode 1: Natural-language question -----------------
+    st.markdown("#### Ask in your own words")
 
-    if query:
-        st.write("### Answer")
-        st.write(answer_query(query, companies))
+    nl_query = st.text_input("Ask a question (e.g., 'Net profit of GAL 2023')", key="nl_query")
+
+    if nl_query:
+        st.write("##### Answer")
+        st.write(answer_query(nl_query, companies))
+
+    st.markdown("---")
+
+    # ----------------- Mode 2: Dropdowns (Company / Metric / Year) -----------------
+    st.markdown("#### Or choose from dropdowns")
+
+    # Layout for dropdowns
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        selected_company = st.selectbox(
+            "Company",
+            sorted(companies.keys()),
+            key="dd_company"
+        )
+
+    comp = companies[selected_company]
+    metric_options = sorted(comp.get("metrics", []))
+    period_options = sorted(comp.get("periods", []))
+
+    with col2:
+        selected_metric = st.selectbox(
+            "Metric (Excel 'Heading' column)",
+            metric_options,
+            key="dd_metric"
+        )
+
+    with col3:
+        # Allow user to select specific year/period
+        selected_period = st.selectbox(
+            "Year / Period",
+            period_options,
+            key="dd_period"
+        )
+
+    if st.button("Get value", key="dd_button"):
+        # Build a precise query string so we reuse the same engine
+        structured_query = f"{selected_metric} of {selected_company} in {selected_period}"
+        st.write("##### Answer")
+        st.write(answer_query(structured_query, companies))
