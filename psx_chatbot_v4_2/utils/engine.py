@@ -1,5 +1,7 @@
 from fuzzywuzzy import fuzz
 import re
+import requests
+import pandas as pd
 
 
 # ===================== Detection helpers =====================
@@ -58,7 +60,8 @@ def _extract_keywords(query, ticker):
     stopwords = {
         "of", "the", "in", "for", "and", "to", "from", "at",
         "on", "is", "are", "was", "were", "this", "that",
-        "year", "years", "value", "what", "tell", "me", "overview", "snapshot", "summary"
+        "year", "years", "value", "what", "tell", "me",
+        "overview", "snapshot", "summary", "company", "view"
     }
 
     ticker_lower = str(ticker).lower() if ticker else ""
@@ -483,12 +486,105 @@ def _build_cross_metric_snapshot(tick, period, comp, role_index):
     return []
 
 
+# ===================== PSX DPS live scraper =====================
+
+def _fetch_psx_overview(ticker):
+    """
+    Fetch latest price, free float %, EPS by year, and latest payout
+    from https://dps.psx.com.pk/company/{ticker}.
+
+    Returns dict:
+      {
+        "price": "561.49",
+        "free_float_pct": "40.00%",
+        "eps_by_year": {"2025": 41.92, "2024": -4.54, ...},
+        "latest_payout": {"date": ..., "details": ..., "book_closure": ...},
+        "source_url": url,
+      }
+    or None on failure.
+    """
+    url = f"https://dps.psx.com.pk/company/{ticker}"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+    except Exception:
+        return None
+
+    html = resp.text
+
+    # --- Latest price: first "Rs.XXXX" we find ---
+    price = None
+    m = re.search(r"Rs\.\s*([\d,]+\.\d+)", html)
+    if m:
+        price = m.group(1)
+
+    # --- Tables via pandas.read_html ---
+    try:
+        tables = pd.read_html(html)
+    except Exception:
+        tables = []
+
+    free_float_pct = None
+    eps_by_year = {}
+    latest_payout = None
+
+    for df in tables:
+        if df.empty:
+            continue
+
+        # Normalize first column for checks
+        first_col_vals = df.iloc[:, 0].astype(str).tolist()
+        cols_lower = [str(c).lower() for c in df.columns]
+
+        # Equity profile table (contains "Free Float")
+        if any("Free Float" in v for v in first_col_vals):
+            # find the row where the second col has a % value
+            for _, row in df.iterrows():
+                if "Free Float" in str(row.iloc[0]) and "%" in str(row.iloc[1]):
+                    free_float_pct = str(row.iloc[1])
+
+        # Annual financials table (contains EPS row and year columns)
+        if any(str(v).strip() == "EPS" for v in first_col_vals) and \
+                any(re.search(r"(19|20)\d{2}", str(c)) for c in df.columns[1:]):
+            years = [str(c) for c in df.columns[1:]]
+            eps_row = df[df.iloc[:, 0].astype(str).str.strip() == "EPS"]
+            if not eps_row.empty:
+                for i, yr in enumerate(years, start=1):
+                    eps_val = eps_row.iloc[0, i]
+                    eps_by_year[yr] = eps_val
+
+        # Payouts table (Date + Book Closure)
+        if "date" in cols_lower and "book closure" in cols_lower:
+            # assume first row is the latest
+            row0 = df.iloc[0]
+            def _get(col_name):
+                if col_name in cols_lower:
+                    idx = cols_lower.index(col_name)
+                    return row0.iloc[idx]
+                return None
+
+            latest_payout = {
+                "date": _get("date"),
+                "details": _get("details"),
+                "book_closure": _get("book closure"),
+            }
+
+    return {
+        "price": price,
+        "free_float_pct": free_float_pct,
+        "eps_by_year": eps_by_year,
+        "latest_payout": latest_payout,
+        "source_url": url,
+    }
+
+
 # ===================== Company snapshot (overview) =====================
 
 def _build_company_snapshot_text(tick, period, comp, role_index):
     """
     Build a compact analyst-style overview for a company in a given period.
-    Includes: sales growth, PAT, margins, ROE, leverage, cash conversion.
+    Includes: sales growth, PAT, margins, ROE, leverage, cash conversion,
+    plus live PSX DPS snapshot (price, free float, EPS by year, latest payout).
     """
     if period is None:
         period = _default_period_from_company(comp)
@@ -591,6 +687,46 @@ def _build_company_snapshot_text(tick, period, comp, role_index):
         lines.append("")
         lines.extend(cross_lines)
 
+    # ---------- 3) Live PSX DPS snapshot ----------
+    psx_data = _fetch_psx_overview(tick)
+    if psx_data:
+        price = psx_data.get("price")
+        free_float_pct = psx_data.get("free_float_pct")
+        eps_by_year = psx_data.get("eps_by_year") or {}
+        latest_payout = psx_data.get("latest_payout")
+
+        psx_lines = []
+        psx_lines.append(f"Market snapshot (PSX DPS for {tick}):")
+
+        if price:
+            psx_lines.append(f"- Latest price: Rs. {price}")
+        if free_float_pct:
+            psx_lines.append(f"- Free float: {free_float_pct}")
+
+        if eps_by_year:
+            # sort years descending
+            year_items = sorted(eps_by_year.items(), key=lambda x: x[0], reverse=True)
+            eps_str = "; ".join(f"{yr}: {val}" for yr, val in year_items)
+            psx_lines.append(f"- EPS by year (Annual, as per PSX DPS): {eps_str}")
+
+        if latest_payout:
+            d = str(latest_payout.get("date", "")).strip()
+            det = str(latest_payout.get("details", "")).strip()
+            bc = str(latest_payout.get("book_closure", "")).strip()
+            parts = []
+            if d:
+                parts.append(d)
+            if det:
+                parts.append(det)
+            if bc:
+                parts.append(f"Book closure: {bc}")
+            if parts:
+                psx_lines.append("- Latest payout: " + " – ".join(parts))
+
+        if len(psx_lines) > 1:
+            lines.append("")
+            lines.extend(psx_lines)
+
     return "\n".join(lines)
 
 
@@ -680,7 +816,7 @@ def _format_single_metric_answer(tick, metric, ctx, comp, role_index):
         values_sorted = [v for _, v in sorted_items]
 
         first_period, first_val = periods_sorted[0], values_sorted[0]
-        last_period, last_val = periods_sorted[-1], values_sorted[-1]
+        last_period, last_val = periods_sorted[-1]
 
         if first_val not in (None, 0):
             n_years = len(values_sorted) - 1
@@ -797,7 +933,8 @@ def answer_query(query, companies):
     - If query looks like 'overview/snapshot/summary of TICKER YEAR':
         => Return a company-level mini-report:
            * sales & PAT with YoY and multi-year sales CAGR,
-           * margins, ROE, ROA, leverage, cash-conversion (cross-metric view).
+           * margins, ROE, ROA, leverage, cash-conversion (cross-metric view),
+           * plus PSX DPS live snapshot (price, free float %, EPS by year, latest payout).
     - Otherwise:
         - If query contains a precise metric phrase (e.g. 'Total Assets', 'Profit after Taxation'),
           return that single metric with:
